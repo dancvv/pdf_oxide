@@ -3608,10 +3608,9 @@ impl PyPdf {
     }
 
     /// Build a PDF by rendering `html` with `css` applied, embedding a
-    /// single font for the body text. The font must cover every
-    /// codepoint used by `html`, or unknown glyphs fall back to
-    /// `.notdef`. See `from_html_css_with_fonts` for a multi-font
-    /// cascade.
+    /// single outline font for the body text. Warns if the font lacks
+    /// characters in the rendered text. Use `from_html_css_with_fonts`
+    /// to supply fallback fonts.
     #[staticmethod]
     fn from_html_css(html: &str, css: &str, font_bytes: &Bound<'_, PyBytes>) -> PyResult<Self> {
         let bytes = font_bytes.as_bytes().to_vec();
@@ -3625,7 +3624,8 @@ impl PyPdf {
     /// Build a PDF from HTML+CSS with a multi-font cascade. `fonts` is
     /// a list of `(family_name, font_bytes)` tuples; the first entry is
     /// the default used whenever a CSS `font-family` doesn't match any
-    /// registered family.
+    /// registered family. Text uses the first family that covers each character.
+    /// Fonts must have glyph outlines.
     #[staticmethod]
     fn from_html_css_with_fonts(
         html: &str,

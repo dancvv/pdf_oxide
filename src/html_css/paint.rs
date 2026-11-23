@@ -160,9 +160,9 @@ pub struct PaintImage {
 /// `style_for` returns the cascaded computed style for a given box id
 /// (the API layer in Phase API wires this from the cascade output).
 /// `font_resource_name` is the registered embedded-font resource name
-/// returned by `PdfWriter::register_embedded_font` — every text box
-/// uses it for v0.3.35.
-pub fn paint_document<'sty>(
+/// returned by `PdfWriter::register_embedded_font` to use when a box has
+/// no matching CSS family. `font_for_box` lists resources in CSS fallback order.
+pub fn paint_document<'sty, F: IntoIterator<Item = String>>(
     writer: &mut PdfWriter,
     doc: &PaginatedDocument,
     tree: &BoxTree,
@@ -171,11 +171,12 @@ pub fn paint_document<'sty>(
     font_size_px: f32,
     link_href_for: impl Fn(u32) -> Option<String>,
     marker_for: impl Fn(u32) -> Option<String>,
-    font_for_box: impl Fn(u32) -> Option<String>,
+    font_for_box: impl Fn(u32) -> F,
     pseudo_before_for: impl Fn(u32) -> Option<String>,
     pseudo_after_for: impl Fn(u32) -> Option<String>,
     image_for: impl Fn(u32) -> Option<PaintImage>,
 ) {
+    let mut missing_counts = std::collections::BTreeMap::new();
     for page in &doc.pages {
         let mut page_builder = writer.add_page(doc.config.width_px, doc.config.height_px);
         paint_page(
@@ -195,7 +196,21 @@ pub fn paint_document<'sty>(
             &pseudo_before_for,
             &pseudo_after_for,
             &image_for,
+            &mut missing_counts,
         );
+    }
+    for (font, count) in missing_counts {
+        let chars = if count == 1 {
+            "character"
+        } else {
+            "characters"
+        };
+        let warning = format!("HTML font '{font}': no supplied font covers {count} {chars}");
+        if log::max_level() == log::LevelFilter::Off {
+            eprintln!("{warning}");
+        } else {
+            log::warn!(target: "pdf_oxide::html_css", "{warning}");
+        }
     }
 }
 
@@ -228,7 +243,7 @@ fn canvas_background<'sty>(
     style_for(body).as_ref().and_then(bg_of)
 }
 
-fn paint_page<'sty>(
+fn paint_page<'sty, F: IntoIterator<Item = String>>(
     page_builder: &mut PageBuilder<'_>,
     fragment: &PageFragment,
     tree: &BoxTree,
@@ -241,10 +256,11 @@ fn paint_page<'sty>(
     font_size_px: f32,
     link_href_for: &impl Fn(u32) -> Option<String>,
     marker_for: &impl Fn(u32) -> Option<String>,
-    font_for_box: &impl Fn(u32) -> Option<String>,
+    font_for_box: &impl Fn(u32) -> F,
     pseudo_before_for: &impl Fn(u32) -> Option<String>,
     pseudo_after_for: &impl Fn(u32) -> Option<String>,
     image_for: &impl Fn(u32) -> Option<PaintImage>,
+    missing_counts: &mut std::collections::BTreeMap<String, usize>,
 ) {
     // CSS 2.1 §14.2 / CSS Backgrounds 3 §3.11.2 — canvas background
     // propagation: the root element's `background-color` (or, if that
@@ -324,9 +340,6 @@ fn paint_page<'sty>(
             }
         }
 
-        let box_font = font_for_box(pb.box_id);
-        let box_font_name: &str = box_font.as_deref().unwrap_or(font_resource_name);
-
         // Per-element CSS properties — walk up to the nearest ancestor
         // with each declaration, falling back to sensible defaults.
         // font-size
@@ -401,19 +414,21 @@ fn paint_page<'sty>(
             flags
         };
 
+        let mut paint_text = |page: &mut PageBuilder<'_>, text: &str, x: f32, y: f32| {
+            let mut families: Vec<_> = font_for_box(pb.box_id).into_iter().collect();
+            if families.is_empty() {
+                families.push(font_resource_name.to_owned());
+            }
+            page.add_html_text(text, x, y, &families, box_font_size_px, missing_counts);
+        };
+
         // List marker — bullet or number drawn at the top-left of the
         // <li> box, offset into the gutter to the left of the content.
         if let Some(marker) = marker_for(pb.box_id) {
             if !marker.is_empty() {
                 let marker_pdf_y = page_height_px - abs_top_y - box_font_size_px;
                 let marker_x = (abs_x - box_font_size_px * 1.2).max(0.0);
-                page_builder.add_embedded_text(
-                    &marker,
-                    marker_x,
-                    marker_pdf_y,
-                    box_font_name,
-                    box_font_size_px,
-                );
+                paint_text(page_builder, &marker, marker_x, marker_pdf_y);
             }
         }
 
@@ -484,25 +499,13 @@ fn paint_page<'sty>(
             if let Some(before) = pseudo_before_for(pb.box_id) {
                 if !before.is_empty() {
                     let y = page_height_px - abs_top_y - box_font_size_px;
-                    page_builder.add_embedded_text(
-                        &before,
-                        abs_x,
-                        y,
-                        box_font_name,
-                        box_font_size_px,
-                    );
+                    paint_text(page_builder, &before, abs_x, y);
                 }
             }
             if let Some(after) = pseudo_after_for(pb.box_id) {
                 if !after.is_empty() {
                     let y = page_height_px - abs_top_y - pb.local.height;
-                    page_builder.add_embedded_text(
-                        &after,
-                        abs_x,
-                        y,
-                        box_font_name,
-                        box_font_size_px,
-                    );
+                    paint_text(page_builder, &after, abs_x, y);
                 }
             }
         }
@@ -521,29 +524,7 @@ fn paint_page<'sty>(
                     page_builder.set_fill_color(r, g, b);
                 }
 
-                #[cfg(feature = "system-fonts")]
-                let routed_shaped = crate::text::bidi::paragraph_is_rtl(s) && {
-                    page_builder.add_shaped_embedded_text(
-                        s,
-                        abs_x,
-                        text_pdf_y,
-                        box_font_name,
-                        box_font_size_px,
-                        crate::writer::ShapeDirection::Rtl,
-                    );
-                    true
-                };
-                #[cfg(not(feature = "system-fonts"))]
-                let routed_shaped = false;
-                if !routed_shaped {
-                    page_builder.add_embedded_text(
-                        s,
-                        abs_x,
-                        text_pdf_y,
-                        box_font_name,
-                        box_font_size_px,
-                    );
-                }
+                paint_text(page_builder, s, abs_x, text_pdf_y);
 
                 // Reset fill color to black after colored text.
                 if box_text_color.is_some() {

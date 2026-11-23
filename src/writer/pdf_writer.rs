@@ -201,6 +201,107 @@ impl<'a> PageBuilder<'a> {
         self
     }
 
+    /// Paint contiguous runs in CSS family order, letting PDF text advances
+    /// position each run after the preceding one across font changes.
+    pub(crate) fn add_html_text(
+        &mut self,
+        text: &str,
+        x: f32,
+        y: f32,
+        css_fonts: &[String],
+        font_size: f32,
+        missing_counts: &mut std::collections::BTreeMap<String, usize>,
+    ) {
+        use super::content_stream::ContentStreamOp;
+
+        let fonts = &mut self.writer.embedded_fonts;
+        if text.chars().any(|ch| ch.len_utf8() == 4) {
+            for font in fonts.values_mut() {
+                font.cache_supplementary_glyphs(text);
+            }
+        }
+        let candidates: Vec<_> = css_fonts
+            .iter()
+            .chain(&self.writer.embedded_font_order)
+            .map(String::as_str)
+            .filter(|name| fonts.contains_key(*name))
+            .collect();
+        let Some(&primary) = candidates.first() else {
+            return;
+        };
+        let mut missing = 0;
+        let mut runs = Vec::new();
+        let mut current = primary;
+        let mut start = 0;
+        for (i, ch) in text.char_indices() {
+            // Keep joiners and variation selectors with the surrounding run
+            // so they can participate in shaping without a standalone glyph.
+            if ch.is_control()
+                || matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
+            {
+                continue;
+            }
+            let name = candidates
+                .iter()
+                .copied()
+                .find(|name| fonts[*name].covers(ch))
+                .unwrap_or_else(|| {
+                    missing += 1;
+                    primary
+                });
+            if name != current {
+                if i > start {
+                    runs.push((current, &text[start..i]));
+                }
+                current = name;
+                start = i;
+            }
+        }
+        if start < text.len() {
+            runs.push((current, &text[start..]));
+        }
+        if missing > 0 {
+            *missing_counts
+                .entry(fonts[primary].name.clone())
+                .or_default() += missing;
+        }
+
+        #[cfg(feature = "system-fonts")]
+        let rtl = crate::text::bidi::paragraph_is_rtl(text);
+        #[cfg(feature = "system-fonts")]
+        if rtl {
+            runs.reverse();
+        }
+
+        let content = &mut self.writer.pages[self.page_index].content_builder;
+        content
+            .begin_text()
+            .op(ContentStreamOp::SetTextMatrix(1.0, 0.0, 0.0, 1.0, x, y));
+        for (name, run) in runs {
+            let font = fonts.get_mut(name).expect("run uses a registered font");
+            #[cfg(feature = "system-fonts")]
+            let glyph_ids = if rtl {
+                super::font_shaping::shape(
+                    run,
+                    font.font_data(),
+                    super::font_shaping::Direction::Rtl,
+                )
+                .map(|shaped| font.encode_shaped_run(&shaped, run))
+                .unwrap_or_else(|| font.encode_string(run))
+            } else {
+                font.encode_string(run)
+            };
+            #[cfg(not(feature = "system-fonts"))]
+            let glyph_ids = font.encode_string(run);
+            content
+                .set_font(name, font_size)
+                .op(ContentStreamOp::ShowEmbeddedText {
+                    font_name: name.to_owned(),
+                    glyph_ids,
+                });
+        }
+    }
+
     /// Add Unicode text on a page using the harfrust shaper. Required
     /// for any complex script (Arabic, Hebrew, Devanagari) where
     /// `add_embedded_text`'s naive char→glyph cmap lookup produces

@@ -982,6 +982,33 @@ impl EmbeddedFont {
         self.glyph_lookup.values().any(|&gid| gid != 0)
     }
 
+    /// The eager cmap cache covers the BMP and emoji. Fill its gaps from the
+    /// actual text before choosing fallback fonts for supplementary characters.
+    pub(crate) fn cache_supplementary_glyphs(&mut self, text: &str) {
+        let Ok(face) = ttf_parser::Face::parse(&self.font_data, 0) else {
+            return;
+        };
+        for ch in text.chars().filter(|ch| ch.len_utf8() == 4) {
+            let cp = u32::from(ch);
+            if self.glyph_lookup.contains_key(&cp) {
+                continue;
+            }
+            if let Some(gid) = face.glyph_index(ch) {
+                self.glyph_lookup.insert(cp, gid.0);
+                let width = u32::from(face.glyph_hor_advance(gid).unwrap_or(0));
+                self.glyph_widths
+                    .insert(gid.0, (width * 1000 / u32::from(self.units_per_em)) as u16);
+            }
+        }
+    }
+
+    /// Whether the cmap directly encodes this character as a non-missing glyph.
+    pub(crate) fn covers(&self, ch: char) -> bool {
+        self.glyph_lookup
+            .get(&(ch as u32))
+            .is_some_and(|&gid| gid != 0)
+    }
+
     /// Get the glyph ID for a Unicode codepoint, with cascading fallbacks:
     ///
     /// 1. Direct lookup in the font's cmap.

@@ -444,6 +444,7 @@ impl Pdf {
     /// * `font_bytes` - TTF/OTF font bytes for body text (any
     ///   permissive-licence sans-serif works; tests/fixtures/fonts/
     ///   DejaVuSans.ttf is the suggested default during development).
+    ///   Requires glyph outlines. Warns if text has no corresponding glyph.
     ///
     /// # Example
     ///
@@ -465,7 +466,9 @@ impl Pdf {
     /// their CSS `font-family` name. The first entry is the default
     /// used by any element whose family doesn't match a registered
     /// name. Family matching is case-insensitive, and the CSS value's
-    /// quoted/unquoted forms are both accepted.
+    /// quoted/unquoted forms are both accepted. Missing glyphs are looked up in
+    /// the remaining CSS families and then the other supplied fonts. A warning
+    /// reports characters no supplied font covers. Bitmap-only fonts are rejected.
     ///
     /// ```ignore
     /// use pdf_oxide::api::Pdf;
@@ -579,6 +582,15 @@ impl Pdf {
         let mut family_to_resource: Vec<(String, String)> = Vec::with_capacity(fonts.len());
         let mut default_resource = String::new();
         for (family, bytes) in fonts {
+            let face = ttf_parser::Face::parse(&bytes, 0)
+                .map_err(|e| crate::error::Error::Unsupported(format!("font {family}: {e}")))?;
+            if !(1..face.number_of_glyphs())
+                .any(|id| face.glyph_bounding_box(ttf_parser::GlyphId(id)).is_some())
+            {
+                return Err(crate::error::Error::Unsupported(format!(
+                    "font {family} has no outline glyphs; HTML-to-PDF requires an outline font"
+                )));
+            }
             let font = EmbeddedFont::from_data(Some(family.clone()), bytes)
                 .map_err(|e| crate::error::Error::Unsupported(format!("font parse: {e}")))?;
             let rn = writer.register_embedded_font(font);
@@ -686,7 +698,7 @@ impl Pdf {
                 // nearest ancestor with a declared `font-family`, then
                 // match each comma-separated family name (case-insensitive,
                 // quotes stripped) against the registered family_to_resource
-                // map. First hit wins; None falls back to the default font.
+                // map, keeping the declared fallback order.
                 let mut cur = Some(id);
                 while let Some(bid) = cur {
                     let node = tree.get(bid);
@@ -733,6 +745,7 @@ impl Pdf {
                                     None
                                 };
 
+                                let mut resources = Vec::new();
                                 let mut idents: Vec<String> = Vec::new();
                                 for cv in &rv.value {
                                     match cv {
@@ -742,7 +755,7 @@ impl Pdf {
                                         ComponentValue::Token(Token::Whitespace) => {},
                                         ComponentValue::Token(Token::Comma) => {
                                             if let Some(rn) = try_lookup(&idents.join(" ")) {
-                                                return Some(rn);
+                                                resources.push(rn);
                                             }
                                             idents.clear();
                                         },
@@ -750,11 +763,11 @@ impl Pdf {
                                             // Flush any pending unquoted idents first, then
                                             // try the quoted name as a standalone candidate.
                                             if let Some(rn) = try_lookup(&idents.join(" ")) {
-                                                return Some(rn);
+                                                resources.push(rn);
                                             }
                                             idents.clear();
                                             if let Some(rn) = try_lookup(s.as_ref()) {
-                                                return Some(rn);
+                                                resources.push(rn);
                                             }
                                         },
                                         _ => {},
@@ -763,14 +776,17 @@ impl Pdf {
                                 // Flush the trailing entry (no comma after the
                                 // last family name).
                                 if let Some(rn) = try_lookup(&idents.join(" ")) {
-                                    return Some(rn);
+                                    resources.push(rn);
+                                }
+                                if !resources.is_empty() {
+                                    return resources;
                                 }
                             }
                         }
                     }
                     cur = node.parent;
                 }
-                None
+                Vec::new()
             },
             |id| {
                 let node = tree.get(id);

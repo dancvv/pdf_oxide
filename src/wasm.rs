@@ -4111,8 +4111,8 @@ impl WasmPdf {
     }
 
     /// Render `html` with `css` applied, embedding `font_bytes` for the
-    /// body text. The font must cover every codepoint used by `html` or
-    /// unknown glyphs fall back to `.notdef`. See
+    /// body text. The font must have glyph outlines. Warns when a character
+    /// in the rendered text has no glyph. See
     /// [`Self::from_html_css_with_fonts`] for a multi-font cascade.
     #[wasm_bindgen(js_name = "fromHtmlCss")]
     pub fn from_html_css(html: &str, css: &str, font_bytes: &[u8]) -> Result<WasmPdf, JsValue> {
@@ -4127,7 +4127,8 @@ impl WasmPdf {
     /// `fonts` are parallel arrays: `families[i]` names the CSS
     /// `font-family` that resolves to `fonts[i]` bytes. The first entry
     /// is the default used whenever a CSS `font-family` doesn't match a
-    /// registered family.
+    /// registered family. Text uses the first family that covers each character.
+    /// Fonts must have glyph outlines.
     #[wasm_bindgen(js_name = "fromHtmlCssWithFonts")]
     pub fn from_html_css_with_fonts(
         html: &str,
