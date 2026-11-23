@@ -21,6 +21,7 @@ To run locally:
 from __future__ import annotations
 
 from pathlib import Path
+from unittest import TestCase
 
 import pytest
 
@@ -258,6 +259,13 @@ def test_pdf_from_html_css_basic():
     rendered = doc.extract_text(0)
     assert "Hello" in rendered
     assert "World" in rendered
+
+
+def test_html_missing_glyph_warning_reaches_root_logger():
+    # Capture only at the root, as an application using the package defaults would.
+    with TestCase().assertLogs(level="WARNING") as captured:
+        pdf_oxide.Pdf.from_html_css("<p>A漢漢B</p>", "", FIXTURE_FONT.read_bytes())
+    assert any("Body" in msg and "2 characters" in msg for msg in captured.output)
 
 
 def test_pdf_from_html_css_with_fonts_cascade():
